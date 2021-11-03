@@ -1,0 +1,531 @@
+#!/usr/bin/python
+
+import sys
+import hcb_utils
+
+sys.path.append('/scratch/postgres/PyGreSQL-3.6.2/')
+import pg
+
+class Predicate:
+    def __init__(self, pred, n, d, a, minv, maxv, md):
+        self.name = pred
+        self.arity = n
+        self.depth = d
+        self.args = a
+        self.min_var = minv
+        self.max_var = maxv
+        self.mode = md
+
+    def output(self):
+        print '%s(%s)' % (self.name, self.print_args()),
+
+    def print_args(self):
+ #       print self.args
+        out = 'var_%d' % self.args[0]
+        for arg in self.args[1:]:
+            out += ',var_%d' % arg
+
+        return out
+
+    def print_untyped_args(self):
+        out = '%d' % self.args[0]
+        for arg in self.args[1:]:
+            out += ',%d' % arg
+        return out
+    
+    def to_string(self):
+        return '%s(%s)' % (self.name,self.print_untyped_args())
+
+    def get_aleph_input(self):
+        result = []
+        for arg_index in range(len(self.mode.args)):
+            if self.mode.args[arg_index][0] == 'input':
+                result.append('[%d]/%s' % (arg_index+1, self.mode.args[arg_index][1]))
+
+        if result == []:
+            return '[]'
+        
+        result_str = '[%s' % result[0]
+        for st in result[1:]:
+            result_str += ',' + st
+        result_str += ']'
+        return result_str
+
+    def get_aleph_output(self):
+        result = []
+        for arg_index in range(len(self.mode.args)):
+            if self.mode.args[arg_index][0] == 'output':
+                result.append('[%d]/%s' % (arg_index+1,self.mode.args[arg_index][1]))
+
+        if result == []:
+            return '[]'
+        
+        result_str = '[%s' % result[0]
+        for st in result[1:]:
+            result_str += ',' + st
+        result_str += ']'
+        return result_str
+
+    def get_input_args(self):
+        result = []
+        for arg_index in range(len(self.mode.args)):
+            if self.mode.args[arg_index][0] == 'input':
+                result.append(self.args[arg_index])
+        return result
+
+    def get_output_args(self):
+        result = []
+        for arg_index in range(len(self.mode.args)):
+            if self.mode.args[arg_index][0] == 'output':
+                result.append(self.args[arg_index])
+        return result
+    
+class Hypothesis:
+    def __init__(self, clause, table, d, minv, maxv, mode_id, tps):
+        self.h = clause
+        self.t = table
+        self.depth = d
+        self.min_depth_var = minv
+        self.max_depth_var = maxv
+        self.mode_index = mode_id
+        self.types = tps
+        
+    def output(self):
+        self.h[0].output()
+        print ' :- ',
+        if len(self.h) > 1:
+            for pred in self.h[1:-1]:
+                pred.output()
+                print ', ',
+                
+            self.h[-1].output()
+        print '.'
+
+
+    def valid_mode(self, mode):
+        if mode.mult == -1:
+            return True
+
+        cur_mult = mode.mult
+        for pred in self.h:
+            if (pred.depth == self.depth and mode is pred.mode):
+                if cur_mult == 1:
+                    return False
+                else:
+                    cur_mult -= 1
+        my_types = self.types.values()
+        for type_name in mode.get_types():
+            if type_name in my_types:
+                return True
+        return False
+    
+    def get_first_extension(self, mode):
+        args = [self.min_depth_var for i in range(mode.arity)]
+        cur_index = len(args) - 1
+        cur_max = self.max_depth_var
+        cur_min = self.min_depth_var
+        new_depth = self.depth
+        
+        while cur_index >= 0:
+            is_ok = False
+            while args[cur_index] <= cur_max:
+                if self.types[args[cur_index]] == mode.args[cur_index][1]:
+                    cur_index -= 1
+                    is_ok = True
+                    break
+                else:
+                    args[cur_index] += 1
+            if not is_ok:
+                if mode.args[cur_index][0] == 'output':
+                    cur_max += 1
+                    self.types[cur_max] = mode.args[cur_index][1]
+                    self.max_var = cur_max
+                    new_depth = self.depth + 1
+                    cur_index -= 1
+                else:
+                    print 'Error in get_first_extension(): did not find a var with the proper type for mode:'
+                    self.output()
+                    print mode.name + ' ' + mode.args
+                    return None
+                
+        return Predicate(mode.pred, mode.arity, self.depth, args, -1, -1, mode)
+
+    def get_next_extension(self, mode, last_extension):
+        last_args = hcb_utils.copy(last_extension.args)
+        #print 'get_next_extension: last_args: ' + last_args
+        cur_max = max(last_args)
+        cur_index = len(last_args) - 1
+        new_depth = self.depth
+        while cur_index >= 0:
+            if last_args[cur_index] > self.max_depth_var:
+                # overflow, but we know is input argument #
+                if last_args[cur_index] < cur_max:
+                    last_args[cur_index] += 1
+                    new_depth += 1
+                    new_min = self.max_depth_var + 1
+                    new_max = max([cur_max,last_args[cur_index]])
+                    break
+                else:
+                    last_args[cur_index] = self.min_depth_var
+                    cur_index -= 1
+                    continue
+            elif last_args[cur_index] == self.max_depth_var:
+                # overflow, check if output variable #
+                if mode.args[cur_index][0] == 'output':
+                    last_args[cur_index] += 1
+                    new_depth += 1
+                    new_min = self.max_depth_var + 1
+                    new_max = max([cur_max, last_args[cur_index]])
+                    break
+                else:
+                    last_args[cur_index] = self.min_depth_var
+                    cur_index -= 1
+                    continue
+            else:
+                # no overflow #
+                last_args[cur_index] += 1
+                new_min = -1
+                new_max = -1
+                break
+
+        if cur_index < 0:
+            return None
+        else:
+   #         print last_args
+            return Predicate(mode.pred, mode.arity, new_depth, last_args, new_min, new_max, mode)
+                
+class Mode:
+    def __init__(self, m, name, n, a):
+        self.pred = name
+        self.arity = n
+        self.args = a
+        self.mult = m
+
+    def get_types(self):
+        result = []
+        for arg in self.args:
+            cur_type = arg[1]
+            if cur_type not in result:
+                result.append(cur_type)
+        return result
+
+class BottomClause:
+    def __init__(self):
+        self.hyp_count = 0
+
+    def insert(self, hypothesis, ant_index):
+        self.hyp_count += 1
+        return self.hyp_count
+        
+class BC_Printer(BottomClause):
+    def insert(self, hypothesis, ant_index):
+        self.hyp_count += 1
+        print 'Hyp number %d:' % self.hyp_count ,
+        hypothesis.output()
+        return self.hyp_count
+
+class BC_Builder(BottomClause):
+    def __init__(self):
+        self.hyp_count = 0
+        self.lits = [('junk',[])]
+        self.last_var = 1
+        self.last_lit = 0
+        
+    def insert(self, hypothesis, ant_index):
+        self.hyp_count += 1
+        cur_lit = hypothesis.h[-1]
+        in_already = -1
+        
+        # check if lit already appears in lit list #
+        for lit_idx in range(1,self.last_lit+1):
+            lit = self.lits[lit_idx][0]
+            if lit.mode is cur_lit.mode and lit.depth == cur_lit.depth and lit.args == cur_lit.args:
+                in_already = lit_idx
+                break
+            
+        if in_already != -1:
+            lit_num = in_already
+        else:
+            self.last_lit += 1
+            lit_num = self.last_lit
+            self.lits.append((cur_lit,[]))
+            tmp_max = max(cur_lit.args)
+            if tmp_max > self.last_var:
+                self.last_var = tmp_max
+                
+        self.lits[ant_index][1].append(lit_num)
+        return lit_num
+
+    def print_out(self):
+        for i in range(1,len(self.lits)):
+            cur_children = self.lits[i][1]
+            print 'lit ' + str(i) + ' [',
+            if cur_children != []:
+                print str(cur_children[0]),
+            
+            for desc in cur_children[1:]:
+               print ',' + str(desc),
+
+            print '] ',
+            self.lits[i][0].output()
+            print ''
+
+    def output_aleph_bc(self,filename):
+        outfile = open(filename,'w')
+        outfile.write(':- eraseall(lits).\n')
+        outfile.write(':- eraseall(ivars).\n')
+        outfile.write(':- eraseall(ovars).\n')
+
+        outfile.write(':- recorda(lits, lit_info(-1,0,junk,[],[],[]),_).\n')
+        outfile.write(':- recorda(ivars, ivars(-1,[]),_).\n')
+        outfile.write(':- recorda(ovars, ovars(-1,[]),_).\n')
+        for i in range(1,self.last_lit+1):
+            cur_lit = self.lits[i][0]
+            children = self.lits[i][1]
+            print_tuple = (i,cur_lit.to_string(),cur_lit.get_aleph_input(),cur_lit.get_aleph_output(),children)
+            outfile.write(':- recordz(lits, lit_info(%d,0,%s,%s,%s,%s),_).\n' % print_tuple)
+            outfile.write(':- recordz(ivars, ivars(%d,%s),_).\n' % (i,cur_lit.get_input_args()))
+            outfile.write(':- recordz(ovars, ovars(%d,%s),_).\n' % (i,cur_lit.get_output_args()))
+
+        outfile.write(':- wild_reset_db_entry(sat,bot_size,%d).\n' % (self.last_lit+1))
+        outfile.write(':- wild_reset_db_entry(sat,last_lit,%d).\n' % (self.hyp_count+1))
+        outfile.write(':- wild_reset_db_entry(sat,last_var,%d).\n' % self.last_var)
+        outfile.write(':- wild_reset_db_entry(sat,head_ivars,%s).\n' % self.lits[1][0].get_output_args())
+        outfile.write(':- wild_reset_db_entry(sat,head_ovars,%s).\n' % self.lits[1][0].get_input_args())
+        
+        outfile.close()
+            
+        
+def unroll(db, hypothesis, new_table, predicate, mode_id, cur_table_index):
+#    print 'Entered unroll with predicate'
+ #   predicate.output()
+    new_min = predicate.min_var
+    new_max = predicate.max_var
+    new_depth = predicate.depth
+
+    cur_hyp = Hypothesis(hypothesis, new_table, new_depth, new_min, new_max, mode_id)
+    result = [cur_hyp]
+
+    cur_args = hcb_utils.copy(predicate.args)
+    
+    # find output columns #
+    output_cols = []
+    for i in range(predicate.arity):
+        if predicate.mode.args[i][0] == 'output':
+            output_cols.append(i)
+
+    num_output_cols = len(output_cols)
+    cur_table = 2
+    
+    select_clause = ['tab1.*']
+    from_clause = [new_table + ' as tab1']
+    where_clause_ids = []
+    where_clause_ineqs = []
+
+    mode_mult = predicate.mode.mult
+    while cur_table <= mode_mult or mode_mult == -1:
+        cur_table_name = 'hyp_table_%d' % cur_table_index[0]
+        for col in output_cols:
+            var_name = predicate.args[col]
+            new_max = cur_args[col] + num_output_cols
+            cur_args[col] = new_max
+            tmpstr = 'tab' + str(cur_table) + '.var_' + str(var_name) + ' as var_' + str(new_max)
+            select_clause.append(tmpstr)
+            for i in range(1,cur_table):
+                tmpstr = 'tab'+str(i)+'.var_' + str(var_name) + ' <> tab' + str(cur_table) + '.var_' + str(var_name)
+                where_clause_ineqs.append(tmpstr)
+
+            tmpstr = 'tab1.id = tab%d.id' % cur_table
+            where_clause_ids.append(tmpstr)
+
+        from_clause.append(new_table + ' as tab' + str(cur_table))
+
+        query = 'create temporary table %s as select %s' % (cur_table_name, select_clause[0])
+        for clause in select_clause[1:]:
+            query += ', ' + clause
+
+        query += ' from ' + from_clause[0]
+        for clause in from_clause[1:]:
+            query += ', ' + clause
+
+        query += ' where ' + where_clause_ids[0]
+        for clause in where_clause_ids[1:]:
+            query += ' and ' + clause
+
+        query += ' and ' + where_clause_ineqs[0]
+        for clause in where_clause_ineqs[1:]:
+            query += ' and ' + clause
+            
+#        print query
+        db.query(query)
+
+        if is_empty(db, cur_table_name):
+#            print 'Table ' + cur_table_name + ' is empty'
+            db.query('drop table ' + cur_table_name)
+            return result
+
+        cur_table_index[0] += 1
+        cur_predicate = Predicate(predicate.name, predicate.arity, predicate.depth, hcb_utils.copy(cur_args), new_min, new_max, predicate.mode)
+        #print 'Unroll output: '
+        #cur_predicate.output()
+        new_h = hcb_utils.copy(cur_hyp.h)
+        new_h.append(cur_predicate)
+        
+        cur_hyp = Hypothesis(new_h, cur_table_name, predicate.depth, new_min, new_max, mode_id)
+        #print 'Unroll output: '
+        #cur_hyp.output()
+        result.append(cur_hyp)
+        cur_table += 1
+
+
+def is_empty(db, table_name):
+    stmt = 'select count(*) from ' + table_name
+    result = db.query(stmt)
+
+    answer = ((result.getresult())[0][0] == 0)
+    return answer
+
+def xjoin(db, hypothesis, predicate, mode_id, col_dict, cur_table_index):
+#    print 'xjoin hyp:'
+#    hypothesis.output()
+#    print 'pred: '
+#    predicate.output()
+#    print ''
+    
+    col_list = col_dict[predicate.name]
+    where_clause = []
+    select_clause = []
+    has_output = False
+    
+    for i in range(len(predicate.args)):
+        if predicate.mode.args[i][0] == 'output':
+            if predicate.args[i] <= hypothesis.max_depth_var:
+                where_clause.append(hypothesis.t + '.var_' + str(predicate.args[i]) + '=' + predicate.name + '.' + col_list[i])
+            elif predicate.args[i] not in predicate.args[:i]:
+                select_clause.append(predicate.name + '.' + col_list[i] + ' as var_' + str(predicate.args[i]))
+                has_output = True
+        else:
+            where_clause.append(hypothesis.t + '.var_' + str(predicate.args[i]) + '=' + predicate.name + '.' + col_list[i])
+
+    tbl_name = 'hyp_table_' + str(cur_table_index[0])
+    stmt = 'create temporary table ' + tbl_name + ' as '
+    stmt += ' select ' + hypothesis.t + '.*' 
+    for clause in select_clause:
+        stmt += ', ' + clause
+
+    stmt += ' from ' + hypothesis.t + ', ' + predicate.name
+    stmt += ' where ' + where_clause[0]
+    for clause in where_clause[1:]:
+        stmt += ' and ' + clause
+
+#    print 'query: ' + stmt
+    db.query(stmt)
+
+    if is_empty(db, tbl_name):
+        db.query('drop table ' + tbl_name)
+        return []
+    
+    cur_table_index[0] += 1
+    new_h = hcb_utils.copy(hypothesis.h)
+    new_h.append(predicate)
+
+    if has_output:
+        result = unroll(db, new_h, tbl_name, predicate, mode_id, cur_table_index)
+        return result
+
+    new_min = hypothesis.min_depth_var
+    new_max = max([predicate.max_var,hypothesis.max_depth_var])
+
+#    print 'prev_hyp_depth: %d, pred_depth: %d, new_min: %d, new_max: %d' % (hypothesis.depth, predicate.depth, new_min, new_max)
+    new_hypothesis = Hypothesis(new_h, tbl_name, predicate.depth, new_min, new_max, mode_id)
+    return [new_hypothesis]
+    #return None
+
+
+def generateH(modes, target, db, seed_table, gamma, phi, depth_bound, length_bound, col_dict, bottom_clause):
+    type_list = target.mode.get_types()
+    types = dict()
+    for idx in range(len(type_list)):
+        types[idx+1]=type_list[idx]
+        
+    init_hyp = Hypothesis([target],seed_table,0,target.min_var, target.max_var, 1,types) # the 1 is a hack to get correct loop init
+    bottom_clause.insert(init_hyp,0)
+    
+    openset = [(init_hyp,1)]
+    cur_table_index = [1]
+    
+    while (openset != []):
+        cur_hyp_pair = gamma(openset)
+        cur_hyp = cur_hyp_pair[0]
+        cur_index = cur_hyp_pair[1]
+        for mode_id in range(cur_hyp.mode_index, len(modes)):
+            mode = modes[mode_id]
+            if cur_hyp.valid_mode(mode):
+                cur_extension = cur_hyp.get_first_extension(mode)
+                while cur_extension != None:
+                    cur_extension.output()
+                    next_hyps = xjoin(db, cur_hyp, cur_extension, mode_id, col_dict, cur_table_index)
+                    for next_hyp in next_hyps:
+                        if phi(next_hyp.t):
+                            next_index = bottom_clause.insert(next_hyp, cur_index)
+                            if (next_hyp.depth <= depth_bound):
+                                openset.append((next_hyp, next_index))
+                            elif (len(next_hyp.h) <= length_bound):
+                                openset.append((next_hyp, next_index))
+                        else:
+                            db.query('drop table ' + next_hyp.t)
+                                
+                    cur_extension = cur_hyp.get_next_extension(mode, cur_extension)
+
+        db.query('drop table ' + cur_hyp.t)
+
+    print 'Space size: %d' % bottom_clause.hyp_count
+
+# end generateH()
+
+def dummy_chooser(list):
+    return list.pop(0)
+
+def dummy_filter(db, hyp):
+    if hyp is None:
+        return False
+    return True
+
+def create_seed(db, table_name, arity, names, selection_clause):
+    seed_tbl_name = table_name + '_seed'
+
+    db.query('alter sequence seed_table_id restart with 1')
+    
+    column_names = range(arity)
+    stmt = 'create table ' + seed_tbl_name + ' as select nextval(\'seed_table_id\') as id, ' + \
+           table_name + '.' + names[0] + ' as var_1'
+    
+    for i in column_names[1:]:
+        stmt += ', ' + table_name + '.' + names[i] + ' as var_' + (i+1)
+
+    stmt += ' from ' + table_name + ' ' + selection_clause
+    print stmt
+    db.query(stmt)
+
+    result = db.query('select * from ' + seed_tbl_name)
+    print result
+    return seed_tbl_name
+            
+def get_seed_count(db, table):
+    query = 'select count(distinct id) from ' + table
+    result = db.query(query)
+    num_seeds = (result.getresult())[0][0]
+ #   print 'Table %s has %d seeds' % (table, num_seeds)
+    return num_seeds
+
+def init_filter(db, support, seed_table):
+    query = 'select count(id) from ' + seed_table
+    result = db.query(query)
+    total_seeds = (result.getresult())[0][0]
+    threshold = total_seeds * support
+#    print 'Threshold will be %d seeds' % threshold
+    return lambda table: get_seed_count(db, table) >= threshold
+
+def connect(db):
+    db_con = pg.connect(dbname = db)
+    return db_con

@@ -1,0 +1,10 @@
+create table p_seed as select nextval('seed_table_id') as id, p.x as var_1 from p 
+id|var_1
+--+-----
+ 1|x    
+ 2|a    
+(2 rows)
+
+
+Hyp number 1: p(var_1)  :-  .
+Space size: 1
